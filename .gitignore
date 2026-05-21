@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# 临时文件
+temp_imgs*/
+*.zip
+*.log
+
+# 环境
+.env
+venv/
+.venv/
