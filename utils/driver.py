@@ -91,12 +91,22 @@ def init_driver() -> webdriver.Chrome:
     if os.path.isdir("/usr/bin"):
         options.add_argument("--single-process")
 
-    chromium_path = "/usr/bin/chromium"
-    chromedriver_bin = "/usr/bin/chromedriver"
-    if os.path.exists(chromium_path):
-        # Streamlit Cloud Linux 环境
-        options.binary_location = chromium_path
-        service = Service(executable_path=chromedriver_bin)
+    # Streamlit Cloud 上 Chromium 可能在不同路径，依次尝试
+    _chromium_candidates = [
+        ("/usr/bin/chromium", "/usr/bin/chromedriver"),
+        ("/usr/bin/chromium-browser", "/usr/bin/chromedriver"),
+        ("/usr/bin/chromium-browser", "/usr/bin/chromium-driver"),
+    ]
+    linux_service = None
+    for _chrom, _driver in _chromium_candidates:
+        if os.path.exists(_chrom) and os.path.exists(_driver):
+            options.binary_location = _chrom
+            linux_service = Service(executable_path=_driver)
+            break
+
+    if linux_service:
+        # Linux 云端环境
+        service = linux_service
     else:
         # 本地环境
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
