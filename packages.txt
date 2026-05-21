@@ -1,2 +1,4 @@
 chromium
 chromium-driver
+fonts-noto-cjk
+fonts-wqy-zenhei
