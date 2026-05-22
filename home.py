@@ -34,5 +34,15 @@ with cols[1]:
     if st.button("进入工具", key="goto_id_fetch", use_container_width=True):
         st.switch_page("pages/2_🔍_达人主页xhsID获取.py")
 
+with cols[2]:
+    st.markdown("""
+    ### 🎵 抖音达人批量截图
+    上传 Excel 链接表，自动截图并按工作表分类打包下载。
+
+    支持暂停、继续、提前结束。
+    """)
+    if st.button("进入工具", key="goto_dy_screenshot", use_container_width=True):
+        st.switch_page("pages/3_🎵_抖音达人批量截图.py")
+
 # st.markdown("---")
 # st.caption("💡 工具箱基于 Streamlit 构建，所有数据在会话内隔离，互不影响。")
