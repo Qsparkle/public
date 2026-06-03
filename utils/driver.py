@@ -134,6 +134,10 @@ def init_driver() -> webdriver.Chrome:
 
 
 def add_cookies_to_driver(driver: webdriver.Chrome, cookies: list, url: str = XHS_LOGIN_URL):
+    # 推断当前平台，用于错误提示和域名修正
+    is_douyin = "douyin.com" in url
+    platform_name = "抖音" if is_douyin else "小红书"
+
     try:
         driver.get(url)
     except Exception as e:
@@ -141,7 +145,7 @@ def add_cookies_to_driver(driver: webdriver.Chrome, cookies: list, url: str = XH
         if "timeout" not in err.lower():
             raise RuntimeError(
                 f"浏览器导航失败（{err}）。\n"
-                "请检查：网络连接是否正常、是否需要代理/VPN 访问小红书。"
+                f"请检查：网络连接是否正常、是否需要代理/VPN 访问{platform_name}。"
             )
 
     time.sleep(2)
@@ -151,11 +155,11 @@ def add_cookies_to_driver(driver: webdriver.Chrome, cookies: list, url: str = XH
         current = driver.current_url
         if current.startswith("chrome-error://") or current.startswith("data:"):
             raise RuntimeError(
-                f"浏览器无法访问小红书（落地页：{current}）。\n"
-                "请检查：\n"
-                "1. 网络连接是否正常\n"
-                "2. 是否需要代理/VPN 才能访问小红书\n"
-                "3. 尝试在普通 Chrome 中打开小红书确认可以访问"
+                f"浏览器无法访问{platform_name}（落地页：{current}）。\n"
+                f"请检查：\n"
+                f"1. 网络连接是否正常\n"
+                f"2. 是否需要代理/VPN 才能访问{platform_name}\n"
+                f"3. 尝试在普通 Chrome 中打开{platform_name}确认可以访问"
             )
     except RuntimeError:
         raise
@@ -166,6 +170,13 @@ def add_cookies_to_driver(driver: webdriver.Chrome, cookies: list, url: str = XH
         try:
             if "name" not in ck or "value" not in ck:
                 continue
+            # 修正拖音 Cookie domain：将 www.douyin.com 统一修正为 .douyin.com
+            # 不带点的根域名才能在子域名页面生效
+            if is_douyin and "domain" in ck:
+                domain = ck["domain"]
+                if domain and not domain.startswith(".") and "douyin.com" in domain:
+                    ck = dict(ck)  # 不修改原对象
+                    ck["domain"] = ".douyin.com"
             driver.add_cookie(ck)
         except Exception:
             continue

@@ -19,9 +19,54 @@ st.set_page_config(page_title="xhs笔记批量截图", page_icon="📸", layout=
 DEFAULT_WAIT = 5
 
 
+# ===== 小红书日期元素隐藏 JS =====
+# 同时包含：按日期 class 隐藏 + 按文本匹配日期格式隐藏
+_JS_HIDE_DATE = """
+(function() {
+    // 1. 小红书已知日期相关类名
+    var dateSelectors = [
+        '.date', '.note-date', '.publish-date', '.post-date',
+        '.time', '.post-time', '.create-time', '.upload-time',
+        '[class*="date"]', '[class*="time"]'
+    ];
+    dateSelectors.forEach(function(sel) {
+        document.querySelectorAll(sel).forEach(function(el) {
+            el.dataset._hiddenByTool = el.style.visibility;
+            el.style.visibility = 'hidden';
+        });
+    });
+    // 2. 匹配日期文本的纯文本节点
+    var walker = document.createTreeWalker(
+        document.body, NodeFilter.SHOW_ELEMENT, null, false
+    );
+    var dateRe = /^\d{4}[-年]\d{1,2}[-月]\d{1,2}[日]?$|^\d{2}-\d{2}-\d{2}$|^\d{4}\/\d{2}\/\d{2}$/;
+    while (walker.nextNode()) {
+        var node = walker.currentNode;
+        if (node.childElementCount === 0) {
+            var txt = node.textContent.trim();
+            if (dateRe.test(txt)) {
+                node.dataset._hiddenByTool = node.style.visibility;
+                node.style.visibility = 'hidden';
+            }
+        }
+    }
+})();
+"""
+
+_JS_RESTORE_DATE = """
+(function() {
+    document.querySelectorAll('[data-_hidden-by-tool]').forEach(function(el) {
+        el.style.visibility = el.dataset._hiddenByTool || '';
+        delete el.dataset._hiddenByTool;
+    });
+})();
+"""
+
+
 # ===== 后台截图线程 =====
 def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
-                      cookies: list, wait_time: int, sid: str):
+                      cookies: list, wait_time: int, sid: str,
+                      hide_date: bool = False):
     tmp_root = "/tmp" if os.path.isdir("/tmp") else "."
     base_tmp = os.path.join(tmp_root, f"temp_imgs_{sid}")
     os.makedirs(base_tmp, exist_ok=True)
@@ -91,11 +136,29 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
                     url = str(row.iloc[2]).strip()
                     if not url.startswith(("http://", "https://")):
                         continue
-                    fname = f"{serial}_{safe_filename(nick)}.png"
-                    path = os.path.join(sheet_dir, fname)
+
                     driver.get(url)
                     time.sleep(wait_time)
-                    driver.save_screenshot(path)
+
+                    if hide_date:
+                        # 隐藏日期元素 → 截图 → 恢复
+                        try:
+                            driver.execute_script(_JS_HIDE_DATE)
+                            time.sleep(0.3)  # 等待渲染生效
+                        except Exception:
+                            pass
+                        fname = f"{serial}_{safe_filename(nick)}_无日期.png"
+                        path = os.path.join(sheet_dir, fname)
+                        driver.save_screenshot(path)
+                        try:
+                            driver.execute_script(_JS_RESTORE_DATE)
+                        except Exception:
+                            pass
+                    else:
+                        fname = f"{serial}_{safe_filename(nick)}.png"
+                        path = os.path.join(sheet_dir, fname)
+                        driver.save_screenshot(path)
+
                     ok += 1
                     total_ok += 1
                 except Exception as e:
@@ -294,6 +357,10 @@ def main():
             pass
 
     wait_time = st.slider("⏱ 页面加载等待时间（秒）", 5, 10, DEFAULT_WAIT)
+    hide_date = st.checkbox(
+        "🗓️ 去除日期截图（截图前自动隐藏页面中的日期元素）",
+        help="将尝试隐藏页面中的日期显示，截图文件名会加 _无日期 后缀以区分。"
+    )
 
     can_start = bool(st.session_state.get("cookies") and st.session_state.get("excel_data"))
     if st.button("🚀 开始批量截图", type="primary", disabled=not can_start):
@@ -304,6 +371,7 @@ def main():
             target=screenshot_worker,
             args=(task, st.session_state.excel_data, st.session_state.excel_name,
                   st.session_state.cookies, wait_time, sid),
+            kwargs={"hide_date": hide_date},
             daemon=True,
         ).start()
         st.rerun()
