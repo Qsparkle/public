@@ -125,6 +125,39 @@ def _has_captcha(driver) -> bool:
         return False
 
 
+def _wait_captcha_clear(driver, timeout: int = 12) -> bool:
+    """等待验证码弹窗彻底消失，消失返回True，超时返回False"""
+    for _ in range(timeout * 2):
+        if not _has_captcha(driver):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+# ===== 页面失效检测 =====
+_PAGE_INVALID_TEXTS = [
+    "该页面已失效", "视频不存在", "您要观看的视频不存在",
+    "内容已被删除", "页面不存在", "该内容已下架",
+    "账号已注销", "很抱歉，您访问的页面不存在",
+    "暂时无法访问", "此内容不可见",
+]
+
+
+def _check_page_invalid(driver) -> str:
+    """检测页面是否失效/不存在，返回原因文字，正常返回空字符串"""
+    try:
+        cur = driver.current_url
+        if cur.startswith("chrome-error://") or cur.startswith("data:"):
+            return "浏览器无法加载页面"
+        src = driver.page_source
+        for kw in _PAGE_INVALID_TEXTS:
+            if kw in src:
+                return kw
+    except Exception:
+        pass
+    return ""
+
+
 # ===== PIL 免费识别缺口位置 =====
 _BG_IMG_SELECTORS = [
     '[class*="captcha-verify-image"]',
@@ -450,6 +483,11 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
                     driver.get(url)
                     time.sleep(wait_time)
 
+                    # 检测页面是否失效/视频不存在
+                    invalid_reason = _check_page_invalid(driver)
+                    if invalid_reason:
+                        raise RuntimeError(f"页面失效：{invalid_reason}")
+
                     # 检测验证码：先尝试自动滑动，最多重试 2 次
                     if _has_captcha(driver):
                         solved = False
@@ -461,7 +499,16 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
                             time.sleep(random.uniform(1, 2))
                         if not solved:
                             raise RuntimeError("验证码自动滑动未通过，已跳过。建议降低批量或增加等待时间")
-                    
+                        # 等待验证码弹窗彻底消失后再截图
+                        task["current_info"] = "验证码已处理，等待页面恢复…"
+                        if not _wait_captcha_clear(driver):
+                            raise RuntimeError("验证码弹窗未消失，截图已跳过")
+                        time.sleep(random.uniform(1.5, 2.5))  # 页面渲染缓冲
+
+                    # 截图前最终确认无验证码
+                    if _has_captcha(driver):
+                        raise RuntimeError("截图前仍检测到验证码弹窗，已跳过")
+
                     # 随机延迟 1–3s，降低风控触发频率
                     time.sleep(random.uniform(1, 3))
                     if hide_date:
@@ -487,7 +534,14 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
                 except Exception as e:
                     fail += 1
                     total_fail += 1
-                    failed_list.append({"sheet": sheet_name, "行": idx + 1, "错误": str(e)})
+                    failed_list.append({
+                        "sheet": sheet_name,
+                        "行": idx + 1,
+                        "序号": serial if 'serial' in dir() else "",
+                        "昵称": nick if 'nick' in dir() else "",
+                        "链接": url if 'url' in dir() else "",
+                        "错误": str(e),
+                    })
 
                 task["total_ok"] = total_ok
                 task["total_fail"] = total_fail
@@ -619,20 +673,37 @@ def main():
                     st.subheader(f"工作表：{item['sheet']}")
                     st.write(f"成功 {item['success']} / 失败 {item['fail']}")
                     if item["fail"] > 0:
-                        st.json(item["failed"])
+                        st.dataframe(pd.DataFrame(item["failed"]), use_container_width=True)
 
+            btn_col_a, btn_col_b = st.columns(2)
             if task.get("zip_data"):
-                st.download_button(
-                    "📥 下载全部截图（ZIP）",
-                    data=task["zip_data"],
-                    file_name=f"{stats['excel_basename']}_抖音截图.zip",
-                    mime="application/zip",
-                    use_container_width=True,
-                    type="primary",
-                )
+                with btn_col_a:
+                    st.download_button(
+                        "📥 下载全部截图（ZIP）",
+                        data=task["zip_data"],
+                        file_name=f"{stats['excel_basename']}_抖音截图.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                        type="primary",
+                    )
 
             if stats["total_fail"] > 0:
-                st.warning("部分失败，可能是 Cookie 过期或链接无效，建议重新获取抖音 Cookie。")
+                # 汇总所有失败行并生成 Excel 供下载
+                all_failed = []
+                for item in stats["details"]:
+                    all_failed.extend(item["failed"])
+                if all_failed:
+                    _fail_buf = io.BytesIO()
+                    pd.DataFrame(all_failed).to_excel(_fail_buf, index=False, engine="openpyxl")
+                    with btn_col_b:
+                        st.download_button(
+                            "📋 下载失败数据（Excel）",
+                            data=_fail_buf.getvalue(),
+                            file_name=f"{stats['excel_basename']}_失败数据.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                        )
+                st.warning("部分失败，可下载失败数据查看原因（页面失效、Cookie过期或链接无效）。")
 
         st.markdown("---")
         with st.popover("🔄 重新开始（上传新文件）", use_container_width=False):
