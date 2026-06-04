@@ -135,11 +135,20 @@ def _wait_captcha_clear(driver, timeout: int = 12) -> bool:
 
 
 # ===== 页面失效检测 =====
+# 只保留抖音错误页独有的完整句式，避免误判正常页面中的评论/标题
 _PAGE_INVALID_TEXTS = [
-    "该页面已失效", "视频不存在", "您要观看的视频不存在",
-    "内容已被删除", "页面不存在", "该内容已下架",
-    "账号已注销", "很抱歉，您访问的页面不存在",
-    "暂时无法访问", "此内容不可见",
+    "您要观看的视频不存在",
+    "很抱歉，您访问的页面不存在",
+    "该页面已失效",
+    "该内容已下架",
+    "账号已注销",
+]
+# 抖音错误页特有的 DOM 元素选择器（双重确认）
+_PAGE_INVALID_SELECTORS = [
+    '[class*="error-page"]',
+    '[class*="page-not-found"]',
+    '[class*="video-not-found"]',
+    '[class*="empty-page"]',
 ]
 
 
@@ -150,9 +159,19 @@ def _check_page_invalid(driver) -> str:
         if cur.startswith("chrome-error://") or cur.startswith("data:"):
             return "浏览器无法加载页面"
         src = driver.page_source
-        for kw in _PAGE_INVALID_TEXTS:
-            if kw in src:
-                return kw
+        # 1. 文本命中特定句式
+        matched_kw = next((kw for kw in _PAGE_INVALID_TEXTS if kw in src), None)
+        if not matched_kw:
+            return ""
+        # 2. DOM 元素二次确认（防止正文/评论中偶然包含关键词）
+        for sel in _PAGE_INVALID_SELECTORS:
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            if els and els[0].is_displayed():
+                return matched_kw
+        # 3. 若未找到错误 DOM，但文本命中的是非常具体的句式也直接判定
+        DEFINITE_TEXTS = ["您要观看的视频不存在", "很抱歉，您访问的页面不存在"]
+        if matched_kw in DEFINITE_TEXTS:
+            return matched_kw
     except Exception:
         pass
     return ""
