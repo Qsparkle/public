@@ -503,7 +503,13 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
                     time.sleep(wait_time)
 
                     # 检测页面是否失效/视频不存在
+                    # 先等页面完全加载，若首次检测到失效，额外再等 3 秒复查一次
+                    # 避免短链跳转或 JS 延迟加载时的瞬时误判
                     invalid_reason = _check_page_invalid(driver)
+                    if invalid_reason:
+                        task["current_info"] = f"疑似页面失效（{invalid_reason}），等待页面完全加载后复查…"
+                        time.sleep(3)
+                        invalid_reason = _check_page_invalid(driver)
                     if invalid_reason:
                         raise RuntimeError(f"页面失效：{invalid_reason}")
 
