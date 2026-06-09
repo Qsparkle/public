@@ -11,7 +11,7 @@ def _home_page():
     st.markdown("选择左侧导航栏中的工具开始使用。")
     st.markdown("---")
 
-    cols = st.columns(1)
+    cols = st.columns(2)
 
     with cols[0]:
         st.markdown("""
@@ -23,15 +23,15 @@ def _home_page():
         if st.button("进入工具", key="goto_screenshot", use_container_width=True):
             st.switch_page("pages/1_📸_xhs笔记批量截图.py")
 
-    # 暂不开放抖音截图入口（功能优化中）
-    # with cols[1]:
-    #     st.markdown("""
-    #     ### 🎵 抖音达人批量截图
-    #     上传 Excel 链接表，自动截图并按工作表分类打包下载。
-    #     支持暂停、继续、提前结束。
-    #     """)
-    #     if st.button("进入工具", key="goto_dy_screenshot", use_container_width=True):
-    #         st.switch_page("pages/3_🎵_抖音达人批量截图.py")
+    with cols[1]:
+        st.markdown("""
+        ### 🎵 抖音达人批量截图
+        上传 Excel 链接表，自动截图并按工作表分类打包下载。
+
+        支持暂停、继续、提前结束。
+        """)
+        if st.button("进入工具", key="goto_dy_screenshot", use_container_width=True):
+            st.switch_page("pages/3_🎵_抖音达人批量截图.py")
 
 
 # ===== 侧边栏导航配置 =====
