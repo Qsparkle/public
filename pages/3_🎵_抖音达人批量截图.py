@@ -107,30 +107,86 @@ _CAPTCHA_ELEM_SELECTORS = [
     '[class*="verify-dialog"]',
 ]
 
-def _has_captcha(driver) -> bool:
-    """检测页面是否出现验证码弹窗
-    同时检查 page_source + document.body.innerText，防止 JS 动态弹窗被漏检
+# ===== 抖音登录弹窗检测（Cookie 失效）=====
+_DY_LOGIN_ANCHOR = "登录后免费畅享高清视频"
+_DY_LOGIN_CONFIRM = ["扫码登录", "验证码登录", "密码登录"]
+
+
+def _dy_check_login_popup(driver) -> bool:
+    """检测抖音是否弹出登录弹窗（Cookie 失效标志）
+    需要标题 + 确认关键词同时命中，防止误判
     """
     try:
-        # 1. 先检查渲染后的屏幕文字（最可靠）
+        text = ""
         try:
-            inner_text = driver.execute_script("return document.body ? document.body.innerText : '';")
-            if inner_text and any(kw in inner_text for kw in _CAPTCHA_KEYWORDS):
+            text = driver.execute_script("return document.body ? document.body.innerText : '';")
+        except Exception:
+            pass
+        if not text:
+            text = driver.page_source
+        if _DY_LOGIN_ANCHOR not in text:
+            return False
+        return any(kw in text for kw in _DY_LOGIN_CONFIRM)
+    except Exception:
+        return False
+
+def _has_captcha(driver) -> bool:
+    """检测页面是否出现验证码弹窗。
+    抓音验证码内容在 iframe 里，需要切入每个 iframe 检查。
+    同时检查主框架 DOM 选择器 + 全部 iframe 文本。
+    """
+    try:
+        # 1. 主框架 innerText
+        try:
+            t = driver.execute_script("return document.body ? document.body.innerText : '';")
+            if t and any(kw in t for kw in _CAPTCHA_KEYWORDS):
                 return True
         except Exception:
             pass
-        # 2. 再检查 page_source（兼容备用）
-        src = driver.page_source
-        if not any(kw in src for kw in _CAPTCHA_KEYWORDS):
-            return False
-        # 3. DOM 元素二次确认
-        for sel in _CAPTCHA_ELEM_SELECTORS:
-            els = driver.find_elements(By.CSS_SELECTOR, sel)
-            if els and els[0].is_displayed():
+
+        # 2. 主框架 page_source
+        try:
+            if any(kw in driver.page_source for kw in _CAPTCHA_KEYWORDS):
                 return True
-        # 文本命中即认定为验证码（DOM 选择器可能失配）
-        return True
+        except Exception:
+            pass
+
+        # 3. 主框架 DOM 元素检测（验证码容器层）
+        for sel in _CAPTCHA_ELEM_SELECTORS:
+            try:
+                els = driver.find_elements(By.CSS_SELECTOR, sel)
+                if els and els[0].is_displayed():
+                    return True
+            except Exception:
+                pass
+
+        # 4. 切入每个 iframe 检查内容（抗音验证码内容在 iframe 里）
+        try:
+            iframes = driver.find_elements(By.TAG_NAME, "iframe")
+            for iframe in iframes:
+                try:
+                    driver.switch_to.frame(iframe)
+                    t = driver.execute_script("return document.body ? document.body.innerText : '';")
+                    driver.switch_to.default_content()
+                    if t and any(kw in t for kw in _CAPTCHA_KEYWORDS):
+                        return True
+                except Exception:
+                    try:
+                        driver.switch_to.default_content()
+                    except Exception:
+                        pass
+        except Exception:
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
+
+        return False
     except Exception:
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
         return False
 
 
@@ -574,6 +630,13 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
                     driver.get(url)
                     time.sleep(wait_time)
 
+                    # 检测 Cookie 是否失效（登录弹窗）——一旦发现立即终止整个任务
+                    if _dy_check_login_popup(driver):
+                        raise RuntimeError(
+                            "❗Cookie 已过期，抖音登录弹窗出现。"
+                            "请重新获取抖音 Cookie 后再运行。|COOKIE_EXPIRED"
+                        )
+
                     # 检测页面是否失效/视频不存在
                     # 先等页面完全加载，若首次检测到失效，额外再等 3 秒复查一次
                     # 避免短链跳转或 JS 延迟加载时的瞬时误判
@@ -642,6 +705,15 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
                     ok += 1
                     total_ok += 1
                 except Exception as e:
+                    err_msg = str(e)
+                    # Cookie 过期——终止整个任务
+                    if "COOKIE_EXPIRED" in err_msg or "Cookie 已过期" in err_msg:
+                        all_stats.append({"sheet": sheet_name, "success": ok,
+                                          "fail": fail, "failed": failed_list})
+                        raise RuntimeError(
+                            "❗ Cookie 已过期，抖音登录弹窗出现。"
+                            "请重新获取抖音 Cookie 后再运行。"
+                        )
                     fail += 1
                     total_fail += 1
                     failed_list.append({
@@ -650,7 +722,7 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
                         "序号": serial if 'serial' in dir() else "",
                         "昵称": nick if 'nick' in dir() else "",
                         "链接": url if 'url' in dir() else "",
-                        "错误": str(e),
+                        "错误": err_msg,
                     })
 
                 task["total_ok"] = total_ok

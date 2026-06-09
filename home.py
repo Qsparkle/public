@@ -40,8 +40,7 @@ def _home_page():
 pg = st.navigation([
     st.Page(_home_page,                             title="🏠 首页"),
     st.Page("pages/1_📸_xhs笔记批量截图.py",        title="📸 xhs笔记批量截图"),
-    # 暂不开放，优化中：
-    # st.Page("pages/3_🎵_抖音达人批量截图.py",        title="🎵 抖音达人批量截图"),
+    st.Page("pages/3_🎵_抖音达人批量截图.py",        title="🎵 抖音达人批量截图"),
     # st.Page("pages/2_🔍_达人主xhsID获取.py",   title="🔍 达人ID获取"),
 ])
 pg.run()
