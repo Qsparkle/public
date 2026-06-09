@@ -18,6 +18,34 @@ st.set_page_config(page_title="xhs笔记批量截图", page_icon="📸", layout=
 
 DEFAULT_WAIT = 5
 
+# ===== 小红书登录弹窗检测 =====
+# 登录弹窗特有的组合关键词：必须同时命中“登录后推荐更懂你的笔记”
+# 并且命中其中至少一个内容可验证关键词，才判定 Cookie 失效
+_XHS_LOGIN_ANCHOR = "登录后推荐更懂你的笔记"  # 只在登录弹窗主标题出现
+_XHS_LOGIN_CONFIRM = ["新用户可直接登录", "手机号登录"]  # 必须同时命中其中一个
+
+
+def _xhs_check_login_popup(driver) -> bool:
+    """检测小红书是否弹出登录弹窗（Cookie 失效标志）
+    需要标题 + 确认关键词同时命中，防止单一关键词导致误判
+    """
+    try:
+        text = ""
+        try:
+            text = driver.execute_script("return document.body ? document.body.innerText : '';")
+        except Exception:
+            pass
+        if not text:
+            text = driver.page_source
+        # 必须先命中标题长句
+        if _XHS_LOGIN_ANCHOR not in text:
+            return False
+        # 再确认至少一个内容可验证关键词
+        return any(kw in text for kw in _XHS_LOGIN_CONFIRM)
+    except Exception:
+        return False
+
+
 # ===== 小红书页面失效检测 =====
 # 只保留小红书错误页独有的完整句式，避免误判正文/评论内容
 _XHS_INVALID_TEXTS = [
@@ -182,6 +210,14 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
                     driver.get(url)
                     time.sleep(wait_time)
 
+                    # 检测 Cookie 是否失效（登录弹窗）——一旦发现立即终止整个任务
+                    if _xhs_check_login_popup(driver):
+                        raise RuntimeError(
+                            "❗Cookie 已过期，小红书登录弹窗出现。"
+                            "请重新获取小红书 Cookie 后再运行。",
+                            "COOKIE_EXPIRED"  # 特殊标识，上层捕获后终止任务
+                        )
+
                     # 检测页面是否失效，首次检测到则额外等 3 秒复查
                     invalid_reason = _xhs_check_page_invalid(driver)
                     if invalid_reason:
@@ -213,6 +249,15 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
                     ok += 1
                     total_ok += 1
                 except Exception as e:
+                    err_msg = str(e)
+                    # Cookie 过期——终止整个任务
+                    if "COOKIE_EXPIRED" in err_msg or "Cookie 已过期" in err_msg:
+                        all_stats.append({"sheet": sheet_name, "success": ok,
+                                          "fail": fail, "failed": failed_list})
+                        raise RuntimeError(
+                            "❗ Cookie 已过期，小红书登录弹窗出现。"
+                            "请重新获取小红书 Cookie 后再运行。"
+                        )
                     fail += 1
                     total_fail += 1
                     failed_list.append({
@@ -221,7 +266,7 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
                         "序号": serial if 'serial' in dir() else "",
                         "昵称": nick if 'nick' in dir() else "",
                         "链接": url if 'url' in dir() else "",
-                        "错误": str(e),
+                        "错误": err_msg,
                     })
 
                 task["total_ok"] = total_ok
