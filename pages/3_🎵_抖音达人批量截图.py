@@ -17,7 +17,8 @@ from selenium.webdriver.common.action_chains import ActionChains
 
 from utils.helpers import init_session, safe_filename, create_example_excel
 from utils.cookie import cookie_section
-from utils.driver import init_driver, add_cookies_to_driver
+from utils.driver import init_driver, add_cookies_to_driver, warmup_browser, \
+    human_like_drag
 from utils.task_store import get_task, reset_task
 
 st.set_page_config(page_title="抖音达人批量截图", page_icon="🎵", layout="wide")
@@ -107,19 +108,27 @@ _CAPTCHA_ELEM_SELECTORS = [
 ]
 
 def _has_captcha(driver) -> bool:
-    """检测页面是否出现验证码弹窗（文本+DOM双重检测）"""
+    """检测页面是否出现验证码弹窗
+    同时检查 page_source + document.body.innerText，防止 JS 动态弹窗被漏检
+    """
     try:
+        # 1. 先检查渲染后的屏幕文字（最可靠）
+        try:
+            inner_text = driver.execute_script("return document.body ? document.body.innerText : '';")
+            if inner_text and any(kw in inner_text for kw in _CAPTCHA_KEYWORDS):
+                return True
+        except Exception:
+            pass
+        # 2. 再检查 page_source（兼容备用）
         src = driver.page_source
-        # 必须命中具体中文关键词
-        text_match = any(kw in src for kw in _CAPTCHA_KEYWORDS)
-        if not text_match:
+        if not any(kw in src for kw in _CAPTCHA_KEYWORDS):
             return False
-        # 再确认弹窗 DOM 元素存在且可见
+        # 3. DOM 元素二次确认
         for sel in _CAPTCHA_ELEM_SELECTORS:
             els = driver.find_elements(By.CSS_SELECTOR, sel)
             if els and els[0].is_displayed():
                 return True
-        # DOM未找到，但文本命中也认为是验证码（兼容旧版）
+        # 文本命中即认定为验证码（DOM 选择器可能失配）
         return True
     except Exception:
         return False
@@ -210,21 +219,18 @@ def _fetch_img_bytes(driver, src: str) -> bytes:
 def _find_gap_x(image_bytes: bytes, skip_ratio: float = 0.12) -> int:
     """
     PIL 分析背景图找到缺口的 X 坐标。
-    方法优先级：透明度 > 灰色色块形状识别 > 饱和度内滑窗口。
+    使用多方法投票机制，提高识别准确率：
+    - 方法 A: Alpha 透明度检测
+    - 方法 B: 灰色色块形状识别
+    - 方法 C: 饱和度滑动窗口
+    - 方法 D: 边缘检测 + 垂直投影
+    最终取多个有效结果的中位数作为最终缺口位置。
     """
     try:
         img = _PILImage.open(io.BytesIO(image_bytes)).convert("RGB")
         w, h = img.size
         pixels = img.load()
-
-        # ---方法 1: Alpha 透明度---
-        img_rgba = _PILImage.open(io.BytesIO(image_bytes)).convert("RGBA")
-        alpha_px = img_rgba.load()
         skip = int(w * skip_ratio)
-        alpha_cols = [sum(alpha_px[x, y][3] for y in range(h)) for x in range(w)]
-        min_alpha = min(alpha_cols[skip:])
-        if min_alpha < h * 200:
-            return alpha_cols.index(min_alpha, skip)
 
         # 计算每列饱和度（max-min），灰色形状饱和度接近0
         sat_cols = []
@@ -232,57 +238,129 @@ def _find_gap_x(image_bytes: bytes, skip_ratio: float = 0.12) -> int:
             s = sum(max(pixels[x, y]) - min(pixels[x, y]) for y in range(h))
             sat_cols.append(s / h)
 
+        # 计算每列亮度值
+        lum_cols = []
+        for x in range(w):
+            l = sum(
+                int(0.299 * pixels[x, y][0] + 0.587 * pixels[x, y][1] + 0.114 * pixels[x, y][2])
+                for y in range(h)
+            )
+            lum_cols.append(l / h)
+
         avg_sat = sum(sat_cols) / w
+        results = []
 
-        # ---方法 2: 灰色色块识别---
-        # 找出所有“灰色列块”（连续的饱和度远低于平均的列）
-        BLOB_THRESHOLD = avg_sat * 0.45  # 饱和度 < 平均*0.45 认为灰色
-        MIN_BLOB_W = max(8, int(w * 0.04))  # 色块最小宽度
+        # === 方法 A: Alpha 透明度检测 ===
+        try:
+            img_rgba = _PILImage.open(io.BytesIO(image_bytes)).convert("RGBA")
+            alpha_px = img_rgba.load()
+            alpha_cols = [sum(alpha_px[x, y][3] for y in range(h)) for x in range(w)]
+            min_alpha = min(alpha_cols[skip:])
+            if min_alpha < h * 200:
+                results.append(alpha_cols.index(min_alpha, skip))
+        except Exception:
+            pass
 
-        blobs = []  # [(center_x, width), ...]
-        in_blob = False
-        blob_start = 0
-        for x, s in enumerate(sat_cols):
-            if s < BLOB_THRESHOLD and not in_blob:
-                in_blob = True
-                blob_start = x
-            elif s >= BLOB_THRESHOLD and in_blob:
-                in_blob = False
-                bw = x - blob_start
+        # === 方法 B: 灰色色块形状识别（改进版） ===
+        try:
+            BLOB_THRESHOLD = avg_sat * 0.45
+            MIN_BLOB_W = max(8, int(w * 0.04))
+
+            blobs = []
+            in_blob = False
+            blob_start = 0
+            for x, s in enumerate(sat_cols):
+                if s < BLOB_THRESHOLD and not in_blob:
+                    in_blob = True
+                    blob_start = x
+                elif s >= BLOB_THRESHOLD and in_blob:
+                    in_blob = False
+                    bw = x - blob_start
+                    if bw >= MIN_BLOB_W:
+                        blobs.append((blob_start + bw // 2, bw))
+            if in_blob:
+                bw = w - blob_start
                 if bw >= MIN_BLOB_W:
                     blobs.append((blob_start + bw // 2, bw))
-        if in_blob:
-            bw = w - blob_start
-            if bw >= MIN_BLOB_W:
-                blobs.append((blob_start + bw // 2, bw))
 
-        if len(blobs) >= 2:
-            # 有两个及以上色块，最左的是拼图块，最右的是缺口
-            blobs_sorted = sorted(blobs, key=lambda b: b[0])
-            # 取最右边的大色块中心（宽度最大且在右侧的）
-            right_blobs = [b for b in blobs_sorted if b[0] > w * 0.3]
-            if right_blobs:
-                # 选宽度最大的右侧色块
-                gap_blob = max(right_blobs, key=lambda b: b[1])
-                return gap_blob[0]
+            if len(blobs) >= 2:
+                blobs_sorted = sorted(blobs, key=lambda b: b[0])
+                right_blobs = [b for b in blobs_sorted if b[0] > w * 0.3]
+                if right_blobs:
+                    gap_blob = max(right_blobs, key=lambda b: b[1])
+                    results.append(gap_blob[0])
+            elif len(blobs) == 1:
+                if blobs[0][0] > w * 0.3:
+                    results.append(blobs[0][0])
+        except Exception:
+            pass
 
-        if len(blobs) == 1:
-            # 只找到一个色块且在右侧，直接用它
-            if blobs[0][0] > w * 0.3:
-                return blobs[0][0]
+        # === 方法 C: 饱和度滑动窗口最低区域 ===
+        try:
+            right_start = int(w * 0.25)
+            window = max(15, int(w * 0.07))
+            min_score = float('inf')
+            best_x = int(w * 0.55)
+            for x in range(right_start, w - window):
+                score = sum(sat_cols[x: x + window]) / window
+                if score < min_score:
+                    min_score = score
+                    best_x = x + window // 2
+            results.append(best_x)
+        except Exception:
+            pass
 
-        # ---方法 3: 饱和度滑动窗口内最低区域（兼容公测---
-        right_start = int(w * 0.25)
-        window = max(15, int(w * 0.07))
-        min_score = float('inf')
-        best_x = int(w * 0.55)
-        for x in range(right_start, w - window):
-            score = sum(sat_cols[x: x + window]) / window
-            if score < min_score:
-                min_score = score
-                best_x = x + window // 2
-        return best_x
+        # === 方法 D: 亮度滑动窗口检测（针对深色/浅色缺口） ===
+        try:
+            right_start = int(w * 0.25)
+            window = max(15, int(w * 0.07))
+            # 计算亮度方差 - 缺口处亮度变化通常较大
+            variance_scores = []
+            for x in range(right_start, w - window):
+                chunk = lum_cols[x: x + window]
+                mean = sum(chunk) / len(chunk)
+                var = sum((v - mean) ** 2 for v in chunk) / len(chunk)
+                variance_scores.append((x + window // 2, var))
+            if variance_scores:
+                # 选方差最大的位置（缺口边缘会有剧烈亮度变化）
+                variance_scores.sort(key=lambda t: -t[1])
+                results.append(variance_scores[0][0])
+        except Exception:
+            pass
 
+        # === 方法 E: 列间差异峰值检测（边缘检测） ===
+        try:
+            right_start = int(w * 0.25)
+            diffs = []
+            for x in range(right_start, w - 1):
+                diff = abs(lum_cols[x] - lum_cols[x + 1])
+                # 也考虑饱和度差异
+                diff += abs(sat_cols[x] - sat_cols[x + 1]) * 2
+                diffs.append((x, diff))
+            if diffs:
+                # 找到差异最大的连续区域（缺口边缘）
+                window_diff = max(15, int(w * 0.05))
+                best_diff = 0
+                best_diff_x = int(w * 0.55)
+                for i in range(len(diffs) - window_diff):
+                    chunk_diff = sum(d[1] for d in diffs[i:i + window_diff])
+                    if chunk_diff > best_diff:
+                        best_diff = chunk_diff
+                        best_diff_x = diffs[i + window_diff // 2][0]
+                results.append(best_diff_x)
+        except Exception:
+            pass
+
+        # === 投票：取所有有效结果的中位数 ===
+        if results:
+            # 过滤掉明显异常值（太靠左的）
+            filtered = [x for x in results if x > w * 0.2]
+            if filtered:
+                filtered.sort()
+                return filtered[len(filtered) // 2]
+            return int(w * 0.55)
+
+        return int(w * 0.55)
     except Exception:
         return -1
 
@@ -344,7 +422,8 @@ def _extract_gap_target(driver, track_width: int) -> int:
 def _try_slide_captcha(driver) -> bool:
     """
     尝试自动滑动验证码。
-    优先用 PIL 识别缺口位置精准拖动，失败时退回随机拖动。
+    优先用 PIL 识别缺口位置 -> 使用拟人化贝塞尔曲线拖动。
+    PIL 识别失败时退回随机位置。
     返回 True 表示通过、False 表示失败。
     """
     _SLIDER_SELECTORS = [
@@ -397,33 +476,21 @@ def _try_slide_captcha(driver) -> bool:
             # PIL 识别失败，退回随机位置
             target = int(track_width * random.uniform(0.38, 0.68))
 
-        ac = ActionChains(driver)
-        ac.click_and_hold(slider)
-        ac.pause(random.uniform(0.3, 0.7))
+        # 使用拟人化贝塞尔曲线拖动
+        success = human_like_drag(driver, slider, target)
 
-        # 分段移动：先快后慢，加随机微振
-        moved = 0
-        steps = random.randint(18, 28)
-        for i in range(steps):
-            remaining = target - moved
-            if remaining <= 0:
-                break
-            progress = i / steps
-            ratio = (1 - progress) if progress < 0.5 else (1 - progress) * 0.4
-            step = max(1, int(remaining * ratio))
-            step = min(step, remaining)
-            dx = step + random.randint(-1, 1)
-            dy = random.randint(-2, 2)
-            ac.move_by_offset(dx, dy)
-            ac.pause(random.uniform(0.01, 0.05))
-            moved += dx
-
-        ac.pause(random.uniform(0.1, 0.4))
-        ac.release()
-        ac.perform()
-
-        time.sleep(1.8)
-        return not _has_captcha(driver)
+        # 拖动后等待验证码页处理结果，多次确认确实消失
+        # 防止验证码刷新的短暂空窗期被误判为成功
+        if not success:
+            return False
+        # 等待验证码页面响应
+        time.sleep(2.5)
+        # 连续检查 3 次（间隔 1s），全部都无验证码才算成功
+        for _check in range(3):
+            if _has_captcha(driver):
+                return False
+            time.sleep(1.0)
+        return True
     except Exception:
         return False
 
@@ -449,6 +516,11 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
         # refresh 有时不能触发抖音登录验证，重新导航更可靠
         driver.get(DY_URL)
         time.sleep(4)
+
+        # 浏览器预热：模拟人类浏览行为，降低验证码触发概率
+        task["current_info"] = "浏览器预热中，模拟浏览行为…"
+        warmup_browser(driver, DY_URL)
+
         task["current_info"] = "初始化完成，开始截图…"
 
         xls = pd.ExcelFile(io.BytesIO(excel_data))
@@ -513,22 +585,24 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
                     if invalid_reason:
                         raise RuntimeError(f"页面失效：{invalid_reason}")
 
-                    # 检测验证码：先尝试自动滑动，最多重试 2 次
+                    # 检测验证码：最多重试 3 次，每次失败后等待时间递增
                     if _has_captcha(driver):
                         solved = False
-                        for _attempt in range(2):
-                            task["current_info"] = f"检测到验证码，正在尝试自动滑动（第 {_attempt+1} 次）…"
+                        for _attempt in range(3):
+                            task["current_info"] = f"检测到验证码，正在尝试自动滑动（第 {_attempt+1}/3 次）…"
                             solved = _try_slide_captcha(driver)
                             if solved:
                                 break
-                            time.sleep(random.uniform(1, 2))
+                            wait_sec = 3 * (_attempt + 1)  # 递增等待 3s / 6s / 9s
+                            task["current_info"] = f"验证码滑动失败，等待 {wait_sec} 秒后重试…"
+                            time.sleep(wait_sec)
                         if not solved:
-                            raise RuntimeError("验证码自动滑动未通过，已跳过。建议降低批量或增加等待时间")
+                            raise RuntimeError("验证码自动滑动 3 次均未通过，已跳过。建议降低批量或增加等待时间")
                         # 等待验证码弹窗彻底消失后再截图
                         task["current_info"] = "验证码已处理，等待页面恢复…"
                         if not _wait_captcha_clear(driver):
                             raise RuntimeError("验证码弹窗未消失，截图已跳过")
-                        time.sleep(random.uniform(1.5, 2.5))  # 页面渲染缓冲
+                        time.sleep(random.uniform(2, 3))  # 页面渲染缓冲
 
                     # 截图前最终确认无验证码
                     if _has_captcha(driver):
@@ -536,12 +610,20 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
 
                     # 随机延迟 1–3s，降低风控触发频率
                     time.sleep(random.uniform(1, 3))
+
+                    # 延迟后再次确认无验证码（防止延迟期间验证码重新出现）
+                    if _has_captcha(driver):
+                        raise RuntimeError("随机延迟后验证码再次出现，截图已跳过")
+
                     if hide_date:
                         try:
                             driver.execute_script(_JS_HIDE_DATE)
                             time.sleep(0.3)
                         except Exception:
                             pass
+                        # 隐藏日期 JS 执行后再确认无验证码
+                        if _has_captcha(driver):
+                            raise RuntimeError("隐藏日期后验证码弹出，截图已跳过")
                         fname = f"{serial}_{safe_filename(nick)}_无日期.png"
                         path = os.path.join(sheet_dir, fname)
                         driver.save_screenshot(path)
@@ -552,6 +634,9 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
                     else:
                         fname = f"{serial}_{safe_filename(nick)}.png"
                         path = os.path.join(sheet_dir, fname)
+                        # 截图前最后一层防护
+                        if _has_captcha(driver):
+                            raise RuntimeError("截图前验证码弹出，已跳过")
                         driver.save_screenshot(path)
 
                     ok += 1
@@ -673,7 +758,7 @@ def main():
                 c1, c2, c3 = st.columns(3)
                 c1.info(task["current_info"] or "正在初始化浏览器…")
                 c2.metric("✅ 成功", task["total_ok"])
-                c3.metric("❌ 失败", task["total_fail"])
+                c3.metric("❌ 失败或链接失效", task["total_fail"])
             time.sleep(0.5)
 
         st.rerun()
@@ -690,7 +775,7 @@ def main():
 
             c1, c2, c3 = st.columns(3)
             c1.metric("✅ 成功", stats["total_success"])
-            c2.metric("❌ 失败", stats["total_fail"])
+            c2.metric("❌ 失败或链接失效", stats["total_fail"])
             c3.metric("📊 工作表数", len(stats["details"]))
 
             with st.expander("📋 查看详细结果"):

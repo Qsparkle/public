@@ -18,6 +18,48 @@ st.set_page_config(page_title="xhs笔记批量截图", page_icon="📸", layout=
 
 DEFAULT_WAIT = 5
 
+# ===== 小红书页面失效检测 =====
+# 只保留小红书错误页独有的完整句式，避免误判正文/评论内容
+_XHS_INVALID_TEXTS = [
+    "你访问的笔记不见了",
+    "该笔记已被作者删除",
+    "该内容已被删除",
+    "很抱歉，此内容已无法显示",
+    "该内容已下架",
+    "当前笔记暂时无法浏览",
+]
+_XHS_INVALID_SELECTORS = [
+    '[class*="error-page"]',
+    '[class*="not-found"]',
+    '[class*="note-not-found"]',
+    '[class*="empty-page"]',
+]
+
+
+def _xhs_check_page_invalid(driver) -> str:
+    """检测小红书页面是否失效，返回原因文字，正常返回空字符串"""
+    from selenium.webdriver.common.by import By
+    try:
+        cur = driver.current_url
+        if cur.startswith("chrome-error://") or cur.startswith("data:"):
+            return "浏览器无法加载页面"
+        src = driver.page_source
+        matched_kw = next((kw for kw in _XHS_INVALID_TEXTS if kw in src), None)
+        if not matched_kw:
+            return ""
+        # DOM 元素二次确认
+        for sel in _XHS_INVALID_SELECTORS:
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            if els and els[0].is_displayed():
+                return matched_kw
+        # 非常具体的大长句式直接判定
+        DEFINITE_TEXTS = ["你访问的笔记不见了", "很抱歉，此内容已无法显示", "当前笔记暂时无法浏览"]
+        if matched_kw in DEFINITE_TEXTS:
+            return matched_kw
+    except Exception:
+        pass
+    return ""
+
 
 # ===== 小红书日期元素隐藏 JS =====
 # 同时包含：按日期 class 隐藏 + 按文本匹配日期格式隐藏
@@ -140,6 +182,15 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
                     driver.get(url)
                     time.sleep(wait_time)
 
+                    # 检测页面是否失效，首次检测到则额外等 3 秒复查
+                    invalid_reason = _xhs_check_page_invalid(driver)
+                    if invalid_reason:
+                        task["current_info"] = f"疑似页面失效（{invalid_reason}），复查中…"
+                        time.sleep(3)
+                        invalid_reason = _xhs_check_page_invalid(driver)
+                    if invalid_reason:
+                        raise RuntimeError(f"页面失效：{invalid_reason}")
+
                     if hide_date:
                         # 隐藏日期元素 → 截图 → 恢复
                         try:
@@ -164,7 +215,14 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
                 except Exception as e:
                     fail += 1
                     total_fail += 1
-                    failed_list.append({"sheet": sheet_name, "行": idx + 1, "错误": str(e)})
+                    failed_list.append({
+                        "sheet": sheet_name,
+                        "行": idx + 1,
+                        "序号": serial if 'serial' in dir() else "",
+                        "昵称": nick if 'nick' in dir() else "",
+                        "链接": url if 'url' in dir() else "",
+                        "错误": str(e),
+                    })
 
                 task["total_ok"] = total_ok
                 task["total_fail"] = total_fail
@@ -270,7 +328,7 @@ def main():
                 c1, c2, c3 = st.columns(3)
                 c1.info(task["current_info"] or "正在初始化浏览器…")
                 c2.metric("✅ 成功", task["total_ok"])
-                c3.metric("❌ 失败", task["total_fail"])
+                c3.metric("❌ 失败或链接失效", task["total_fail"])
             time.sleep(0.5)
 
         st.rerun()
@@ -287,7 +345,7 @@ def main():
 
             c1, c2, c3 = st.columns(3)
             c1.metric("✅ 成功", stats["total_success"])
-            c2.metric("❌ 失败", stats["total_fail"])
+            c2.metric("❌ 失败或链接失效", stats["total_fail"])
             c3.metric("📊 工作表数", len(stats["details"]))
 
             with st.expander("📋 查看详细结果"):
@@ -295,20 +353,36 @@ def main():
                     st.subheader(f"工作表：{item['sheet']}")
                     st.write(f"成功 {item['success']} / 失败 {item['fail']}")
                     if item["fail"] > 0:
-                        st.json(item["failed"])
+                        st.dataframe(pd.DataFrame(item["failed"]), use_container_width=True)
 
+            btn_col_a, btn_col_b = st.columns(2)
             if task.get("zip_data"):
-                st.download_button(
-                    "📥 下载全部截图（ZIP）",
-                    data=task["zip_data"],
-                    file_name=f"{stats['excel_basename']}_截图.zip",
-                    mime="application/zip",
-                    use_container_width=True,
-                    type="primary",
-                )
+                with btn_col_a:
+                    st.download_button(
+                        "📥 下载全部截图（ZIP）",
+                        data=task["zip_data"],
+                        file_name=f"{stats['excel_basename']}_截图.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                        type="primary",
+                    )
 
             if stats["total_fail"] > 0:
-                st.warning("部分失败，可能是 Cookie 过期或链接无效，建议重新获取 Cookie。")
+                all_failed = []
+                for item in stats["details"]:
+                    all_failed.extend(item["failed"])
+                if all_failed:
+                    _fail_buf = io.BytesIO()
+                    pd.DataFrame(all_failed).to_excel(_fail_buf, index=False, engine="openpyxl")
+                    with btn_col_b:
+                        st.download_button(
+                            "📋 下载失败数据（Excel）",
+                            data=_fail_buf.getvalue(),
+                            file_name=f"{stats['excel_basename']}_失败数据.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                        )
+                st.warning("部分失败，可下载失败数据查看原因（页面失效、Cookie过期或链接无效）。")
 
         st.markdown("---")
         with st.popover("🔄 重新开始（上传新文件）", use_container_width=False):
