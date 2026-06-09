@@ -1,6 +1,7 @@
 """
 ChromeDriver 管理 + Selenium 工具。
 get_chromedriver_path 使用 @st.cache_resource，全局只下载一次。
+包含：warmup_browser、human_like_drag 等拡展函数。
 """
 import os
 import glob
