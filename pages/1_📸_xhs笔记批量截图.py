@@ -227,6 +227,29 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
                     if invalid_reason:
                         raise RuntimeError(f"页面失效：{invalid_reason}")
 
+                    # 检测是否被跳转到小红书首页（失效页自动跳转）
+                    # 笔记链接应包含 /explore/ 等路径，跳回根域即首页
+                    try:
+                        cur_url = driver.current_url
+                        # 小红书首页地址特征：主域后无路径或仅有一个斜杠
+                        is_homepage = (
+                            cur_url.rstrip("/") in (
+                                "https://www.xiaohongshu.com",
+                                "http://www.xiaohongshu.com",
+                            )
+                            or cur_url in (
+                                "https://www.xiaohongshu.com/",
+                                "http://www.xiaohongshu.com/",
+                            )
+                        )
+                        # 原始 URL 应包含小红书内容路径，跳回首页则判定为失效
+                        if is_homepage and "/" in url.replace("https://", "").replace("http://", ""):
+                            raise RuntimeError("页面已跳转至小红书首页，笔记已失效")
+                    except RuntimeError:
+                        raise
+                    except Exception:
+                        pass
+
                     if hide_date:
                         # 隐藏日期元素 → 截图 → 恢复
                         try:
