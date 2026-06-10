@@ -551,9 +551,21 @@ def _try_slide_captcha(driver) -> bool:
         return False
 
 
+def _save_screenshot(driver, path: str, img_format: str = "PNG", jpeg_quality: int = 85):
+    """截图保存，支持 PNG 和 JPEG 格式。"""
+    if img_format == "JPEG":
+        png_bytes = driver.get_screenshot_as_png()
+        from PIL import Image as _PIL
+        import io as _io
+        img = _PIL.open(_io.BytesIO(png_bytes)).convert("RGB")
+        img.save(path, "JPEG", quality=jpeg_quality, optimize=True)
+    else:
+        driver.save_screenshot(path)
+
+
 def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
                       cookies: list, wait_time: int, sid: str,
-                      hide_date: bool = False):
+                      hide_date: bool = False, img_format: str = "PNG"):
     tmp_root = "/tmp" if os.path.isdir("/tmp") else "."
     base_tmp = os.path.join(tmp_root, f"temp_imgs_{sid}_dy")
     os.makedirs(base_tmp, exist_ok=True)
@@ -687,20 +699,22 @@ def screenshot_worker(task: dict, excel_data: bytes, excel_name: str,
                         # 隐藏日期 JS 执行后再确认无验证码
                         if _has_captcha(driver):
                             raise RuntimeError("隐藏日期后验证码弹出，截图已跳过")
-                        fname = f"{serial}_{safe_filename(nick)}_无日期.png"
+                        ext = "jpg" if img_format == "JPEG" else "png"
+                        fname = f"{serial}_{safe_filename(nick)}_无日期.{ext}"
                         path = os.path.join(sheet_dir, fname)
-                        driver.save_screenshot(path)
+                        _save_screenshot(driver, path, img_format)
                         try:
                             driver.execute_script(_JS_RESTORE_DATE)
                         except Exception:
                             pass
                     else:
-                        fname = f"{serial}_{safe_filename(nick)}.png"
+                        ext = "jpg" if img_format == "JPEG" else "png"
+                        fname = f"{serial}_{safe_filename(nick)}.{ext}"
                         path = os.path.join(sheet_dir, fname)
                         # 截图前最后一层防护
                         if _has_captcha(driver):
                             raise RuntimeError("截图前验证码弹出，已跳过")
-                        driver.save_screenshot(path)
+                        _save_screenshot(driver, path, img_format)
 
                     ok += 1
                     total_ok += 1
@@ -939,6 +953,15 @@ def main():
         help="将尝试隐藏页面中的日期显示，截图文件名会加 _无日期 后缀以区分。"
     )
 
+    img_format = st.radio(
+        "📷 截图格式",
+        ["JPEG（推荐，文件小约 80%，下载快）", "PNG（无损，文件较大）"],
+        index=0,
+        horizontal=True,
+        help="JPEG 格式文件体积约为 PNG 的 1/5，下载速度更快；PNG 为无损格式，细节更清晰。"
+    )
+    use_jpeg = img_format.startswith("JPEG")
+
     can_start = bool(st.session_state.get("dy_cookies") and st.session_state.get("excel_data"))
     if st.button("🚀 开始批量截图", type="primary", disabled=not can_start):
         reset_task(task_sid)
@@ -948,7 +971,7 @@ def main():
             target=screenshot_worker,
             args=(task, st.session_state.excel_data, st.session_state.excel_name,
                   st.session_state.dy_cookies, wait_time, task_sid),
-            kwargs={"hide_date": hide_date},
+            kwargs={"hide_date": hide_date, "img_format": "JPEG" if use_jpeg else "PNG"},
             daemon=True,
         ).start()
         st.rerun()
